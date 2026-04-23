@@ -13,15 +13,28 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+PROVIDER = os.environ.get("CONTEXT_POLICE_PROVIDER", "openai").lower()
 LLM_URL = os.environ.get("CONTEXT_POLICE_LLM_URL", "http://172.21.0.154:1234")
-MODEL_ID = os.environ.get("CONTEXT_POLICE_MODEL", "qwen/qwen3-8b")
+AWS_REGION = os.environ.get("CONTEXT_POLICE_REGION", "us-east-1")
+_DEFAULT_MODEL = (
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    if PROVIDER == "bedrock"
+    else "qwen/qwen3-8b"
+)
+MODEL_ID = os.environ.get("CONTEXT_POLICE_MODEL", _DEFAULT_MODEL)
 LLM_TIMEOUT_S = int(os.environ.get("CONTEXT_POLICE_TIMEOUT", "120"))
-MAX_LLM_CHARS = int(os.environ.get("CONTEXT_POLICE_MAX_CHARS", "80000"))
+_DEFAULT_MAX_CHARS = "400000" if PROVIDER == "bedrock" else "8000"
+MAX_LLM_CHARS = int(os.environ.get("CONTEXT_POLICE_MAX_CHARS", _DEFAULT_MAX_CHARS))
 TOOL_RESULT_TRUNC = int(os.environ.get("CONTEXT_POLICE_TOOL_TRUNC", "500"))
 LOG_FILE = Path(os.environ.get(
     "CONTEXT_POLICE_LOG",
     str(Path.home() / ".claude" / "context-police.log"),
 ))
+
+STATE_DIR = Path.home() / ".claude" / "context-police"
+LAST_SUMMARY_PATH = STATE_DIR / "last-summary.json"
+LAST_RECO_PATH = STATE_DIR / "last-recommendations.md"
+CUSTOM_PROMPT_PATH = STATE_DIR / "extract-prompt.md"
 
 _REAL_STDOUT = sys.__stdout__
 TTY = None
@@ -121,10 +134,40 @@ def extract_metrics(p: dict) -> tuple[str, str | None, int | None, int]:
     return trigger, transcript_path, cur, maxt
 
 
+class _TTYIO:
+    def __init__(self, reader, writer):
+        self._r = reader
+        self._w = writer
+    def write(self, s):
+        return self._w.write(s)
+    def flush(self):
+        self._w.flush()
+    def readline(self):
+        return self._r.readline()
+    def close(self):
+        for h in (self._r, self._w):
+            try:
+                h.close()
+            except Exception:
+                pass
+
+
 def open_tty():
+    # Open read and write handles separately — text-mode "r+" on /dev/tty
+    # fails with "not seekable" on some Python builds (e.g. macOS Python 3.9),
+    # because TextIOWrapper over a BufferedRandom requires a seekable stream.
+    r = w = None
     try:
-        return open("/dev/tty", "r+", buffering=1)
+        r = open("/dev/tty", "r")
+        w = open("/dev/tty", "w", buffering=1)
+        return _TTYIO(r, w)
     except OSError:
+        for h in (r, w):
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
         return None
 
 
@@ -274,38 +317,57 @@ def compress_for_llm(text: str) -> tuple[str, bool, str]:
     nl = tail.find("\n")
     if nl != -1 and nl < 500:
         tail = tail[nl + 1:]
-    note = f"[transcript truncated: {dropped} chars from the beginning omitted]"
-    return f"{note}\n\n{tail}", True, f"Dropped {dropped} chars from the start to fit LLM window."
+    return tail, True, f"Dropped {dropped} chars from the start to fit LLM window."
+
+
+_DEFAULT_ANALYSIS_SYSTEM_PROMPT = (
+    "You are analyzing a Claude Code CLI conversation transcript. The user is a "
+    "developer deciding whether to let Claude Code auto-compact (summarize) this "
+    "conversation. Your job is to help them decide by producing a structured summary.\n\n"
+    "Identify the most useful categories FOR THIS SPECIFIC CONVERSATION. Do not use a "
+    "fixed taxonomy. Examples that might apply: \"Current task\", \"Files touched\", "
+    "\"Decisions made\", \"Open questions\", \"Errors encountered\", \"Next steps\", "
+    "\"Context that must survive compaction\". Pick 3 to 7 categories that actually help.\n\n"
+    "Output ONLY valid JSON matching this schema — no prose, no markdown fences:\n\n"
+    "{\n"
+    "  \"categories\": [\n"
+    "    {\"name\": \"string (Title Case)\",\n"
+    "     \"summary\": \"string (1-2 sentences)\",\n"
+    "     \"percent_tokens\": 0,\n"
+    "     \"items\": [\"string (concise bullet)\", \"...\"]}\n"
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Order categories by importance (most-critical-to-preserve first).\n"
+    "- `percent_tokens` is an integer 0–100 estimating what fraction of the transcript's "
+    "context budget this category represents. Estimates don't need to sum to 100 (topics "
+    "may overlap) — each value expresses the category's individual weight.\n"
+    "- Items concise — one line each, no sub-bullets, no markdown.\n"
+    "- Do not invent facts. If unsure, omit."
+)
+
+
+def load_custom_system_prompt() -> str | None:
+    try:
+        if CUSTOM_PROMPT_PATH.exists():
+            content = CUSTOM_PROMPT_PATH.read_text().strip()
+            return content or None
+    except OSError as e:
+        log(f"could not read custom prompt at {CUSTOM_PROMPT_PATH}: {e}")
+    return None
 
 
 def build_analysis_messages(transcript_text: str) -> list[dict]:
-    system = (
-        "You are analyzing a Claude Code CLI conversation transcript. The user is a "
-        "developer deciding whether to let Claude Code auto-compact (summarize) this "
-        "conversation. Your job is to help them decide by producing a structured summary.\n\n"
-        "Identify the most useful categories FOR THIS SPECIFIC CONVERSATION. Do not use a "
-        "fixed taxonomy. Examples that might apply: \"Current task\", \"Files touched\", "
-        "\"Decisions made\", \"Open questions\", \"Errors encountered\", \"Next steps\", "
-        "\"Context that must survive compaction\". Pick 3 to 7 categories that actually help.\n\n"
-        "Output ONLY valid JSON matching this schema — no prose, no markdown fences:\n\n"
-        "{\n"
-        "  \"categories\": [\n"
-        "    {\"name\": \"string (Title Case)\",\n"
-        "     \"summary\": \"string (1-2 sentences)\",\n"
-        "     \"items\": [\"string (concise bullet)\", \"...\"]}\n"
-        "  ]\n"
-        "}\n\n"
-        "Rules:\n"
-        "- Order categories by importance (most-critical-to-preserve first).\n"
-        "- Items concise — one line each, no sub-bullets, no markdown.\n"
-        "- Do not invent facts. If unsure, omit.\n"
-        "- If you see a \"[transcript truncated]\" marker, add a \"Truncation Notice\" category."
-    )
+    system = load_custom_system_prompt() or _DEFAULT_ANALYSIS_SYSTEM_PROMPT
     user = (
-        "Transcript follows. Analyze it and produce the JSON described.\n\n"
-        "---\n"
+        "Analyze the Claude Code session transcript between the markers below. "
+        "Produce ONLY the JSON object defined in the system prompt (top-level "
+        "\"categories\" array). Do NOT echo any JSON from the transcript. Do NOT "
+        "wrap the output in code fences.\n\n"
+        "=== TRANSCRIPT START ===\n"
         f"{transcript_text}\n"
-        "---"
+        "=== TRANSCRIPT END ===\n\n"
+        "Now emit the categorized JSON and nothing else:"
     )
     return [
         {"role": "system", "content": system},
@@ -314,6 +376,12 @@ def build_analysis_messages(transcript_text: str) -> list[dict]:
 
 
 def call_llm(messages: list[dict]) -> tuple[bool, str]:
+    if PROVIDER == "bedrock":
+        return call_llm_bedrock(messages)
+    return call_llm_openai(messages)
+
+
+def call_llm_openai(messages: list[dict]) -> tuple[bool, str]:
     body = json.dumps({
         "model": MODEL_ID,
         "messages": messages,
@@ -354,6 +422,76 @@ def call_llm(messages: list[dict]) -> tuple[bool, str]:
     except Exception as e:
         log(f"LLM unexpected error: {e}")
         return False, f"Unexpected LLM error: {e}"
+
+
+def call_llm_bedrock(messages: list[dict]) -> tuple[bool, str]:
+    import tempfile
+
+    system_blocks: list[dict] = []
+    convo: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "system":
+            system_blocks.append({"text": content})
+        elif role in ("user", "assistant"):
+            convo.append({"role": role, "content": [{"text": content}]})
+
+    paths: list[str] = []
+
+    def write_tmp(obj) -> str:
+        fd, p = tempfile.mkstemp(suffix=".json", prefix="ctxpolice-")
+        os.close(fd)
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        paths.append(p)
+        return p
+
+    try:
+        msg_path = write_tmp(convo)
+        cfg_path = write_tmp({"maxTokens": 2000, "temperature": 0.2})
+        cmd = [
+            "aws", "bedrock-runtime", "converse",
+            "--region", AWS_REGION,
+            "--model-id", MODEL_ID,
+            "--messages", f"file://{msg_path}",
+            "--inference-config", f"file://{cfg_path}",
+        ]
+        if system_blocks:
+            cmd += ["--system", f"file://{write_tmp(system_blocks)}"]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=LLM_TIMEOUT_S,
+            )
+        except FileNotFoundError:
+            return False, "aws CLI not found — install it and configure credentials."
+        except subprocess.TimeoutExpired:
+            return False, f"Bedrock call timed out after {LLM_TIMEOUT_S}s."
+    finally:
+        for p in paths:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip() or "(no stderr)"
+        log(f"Bedrock aws CLI exit {proc.returncode}: {err[:500]}")
+        return False, f"aws exited {proc.returncode}: {err[:400]}"
+
+    try:
+        data = json.loads(proc.stdout)
+        blocks = data.get("output", {}).get("message", {}).get("content", [])
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+        if not text:
+            return False, f"Empty Bedrock response: {proc.stdout[:400]}"
+        return True, text
+    except json.JSONDecodeError as e:
+        return False, f"Bedrock response not JSON ({e}): {proc.stdout[:400]}"
 
 
 def parse_llm_json(raw: str) -> dict:
@@ -475,15 +613,251 @@ def headless_notify(msg: str) -> None:
         pass
 
 
-def run_standalone() -> None:
+def render_bar(pct: int, width: int = 20) -> str:
+    pct = max(0, min(100, int(pct)))
+    filled = (pct * width + 50) // 100  # rounded
+    return "█" * filled + "░" * (width - filled)
+
+
+def render_summary_plain(parsed: dict) -> None:
+    """ANSI-free version of show_summary for non-interactive callers."""
+    cats = parsed.get("categories") if isinstance(parsed, dict) else None
+    if not cats or not isinstance(cats, list):
+        print("LLM returned no categories. Raw payload:")
+        print(json.dumps(parsed, indent=2, ensure_ascii=False))
+        return
+    print()
+    print("=== Context Analysis ===")
+    print()
+    for cat in cats:
+        if not isinstance(cat, dict):
+            continue
+        name = cat.get("name", "(unnamed)")
+        summary = cat.get("summary", "")
+        items = cat.get("items", []) or []
+        pct = cat.get("percent_tokens")
+        print(f"# {name}")
+        if isinstance(pct, (int, float)):
+            print(f"  {render_bar(int(pct))}  {int(pct)}% of transcript")
+        if summary:
+            print(f"  {summary}")
+        for item in items:
+            print(f"  - {item}")
+        print()
+
+
+def save_last_summary(parsed: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_SUMMARY_PATH.write_text(
+            json.dumps(parsed, indent=2, ensure_ascii=False)
+        )
+    except OSError as e:
+        log(f"could not save last summary: {e}")
+
+
+def load_last_summary() -> dict | None:
+    try:
+        if LAST_SUMMARY_PATH.exists():
+            return json.loads(LAST_SUMMARY_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"could not load last summary: {e}")
+    return None
+
+
+def build_recommendations_messages(transcript_text: str) -> list[dict]:
+    system = (
+        "You are a Claude Code assistant reviewing a session transcript. The user wants "
+        "concrete, actionable recommendations to reduce context-window usage and avoid "
+        "hitting auto-compaction. Tie every recommendation to something specific in THIS "
+        "transcript — a particular tool call, file, topic, or pattern that is bloating "
+        "context. Do not produce generic advice.\n\n"
+        "Output ONLY a Markdown bullet list. 3–7 bullets. Each bullet is one line, "
+        "imperative voice. No headings, no preamble, no closing remarks."
+    )
+    user = (
+        "Transcript follows between the markers. Produce the bullet list of "
+        "recommendations and nothing else.\n\n"
+        "=== TRANSCRIPT START ===\n"
+        f"{transcript_text}\n"
+        "=== TRANSCRIPT END ===\n\n"
+        "Now emit the recommendations:"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def save_last_recommendations(text: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_RECO_PATH.write_text(text)
+    except OSError as e:
+        log(f"could not save last recommendations: {e}")
+
+
+def render_menu_static() -> None:
+    """Print the inspector menu as plain text to stdout, no input loop.
+    Intended for display inside Claude Code's chat (Bash tool has no TTY)."""
+    transcript_path = find_latest_transcript() or "(none found)"
+    custom = "(custom prompt)" if CUSTOM_PROMPT_PATH.exists() else "(default prompt)"
+    cached = "yes" if LAST_SUMMARY_PATH.exists() else "no"
+    lines = [
+        "",
+        "  ╔══════════════════════════════════════════╗",
+        "  ║      ContextPolice — Inspector           ║",
+        "  ╚══════════════════════════════════════════╝",
+        "",
+        f"  Transcript: {transcript_path}",
+        f"  Prompt: {custom}    Cached summary: {cached}",
+        "",
+        "  What do you want to do?",
+        "",
+        "  [1]  LLM analysis (Bedrock Sonnet 4.5)    categories + token bars",
+        "  [2]  LLM analysis (local LM Studio)       categories + token bars",
+        "  [3]  Raw transcript                       dump formatted, as-is",
+        "  [4]  Recommendations                      actionable tips to reduce context",
+        "  [5]  Edit summarization prompt            seed/override the system prompt",
+        "  [6]  View last cached summary             no new LLM call",
+        "  [q]  Quit",
+        "",
+    ]
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def run_view_last_summary() -> None:
+    parsed = load_last_summary()
+    if parsed is None:
+        print(
+            "No cached summary found. Run option 1 or 2 first to generate one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"(cached summary from {LAST_SUMMARY_PATH})", file=sys.stderr)
+    render_summary_plain(parsed)
+
+
+def run_edit_prompt() -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if not CUSTOM_PROMPT_PATH.exists() or CUSTOM_PROMPT_PATH.read_text().strip() == "":
+            CUSTOM_PROMPT_PATH.write_text(_DEFAULT_ANALYSIS_SYSTEM_PROMPT + "\n")
+            seeded = True
+        else:
+            seeded = False
+    except OSError as e:
+        print(f"ContextPolice: could not prepare prompt file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    action = "Seeded with the default prompt" if seeded else "Existing custom prompt detected"
+    print()
+    print("=== Custom summarization prompt ===")
+    print()
+    print(f"  Path: {CUSTOM_PROMPT_PATH}")
+    print(f"  {action}.")
+    print()
+    print("  Edit the file with any editor — its contents REPLACE the default system")
+    print("  prompt used by options 1 and 2. Delete the file (or empty it) to restore")
+    print("  the built-in prompt.")
+    print()
+    print("  Quick open:")
+    print(f"    code \"{CUSTOM_PROMPT_PATH}\"")
+    print(f"    open -a TextEdit \"{CUSTOM_PROMPT_PATH}\"")
+    print(f"    $EDITOR \"{CUSTOM_PROMPT_PATH}\"")
+    print()
+
+
+def run_standalone_noninteractive(mode: str) -> None:
+    """No-TTY fallback: produce plain-text output on stdout so a caller
+    (Claude Code's Bash tool, a pipe, CI, etc.) can display it."""
+    if mode == "menu":
+        render_menu_static()
+        return
+    if mode == "view-last":
+        run_view_last_summary()
+        return
+    if mode == "edit-prompt":
+        run_edit_prompt()
+        return
+
+    transcript_path = find_latest_transcript()
+    if not transcript_path:
+        print("ContextPolice: no transcript found under ~/.claude/projects/.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    records = load_transcript(transcript_path)
+    if not records:
+        print(f"ContextPolice: transcript empty or unreadable: {transcript_path}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    text = format_transcript(records)
+
+    if mode == "raw":
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        return
+
+    compressed, truncated, note = compress_for_llm(text)
+    if truncated:
+        print(f"[note] {note}", file=sys.stderr)
+
+    if mode == "recommend":
+        print(f"[info] asking {MODEL_ID} for recommendations (up to {LLM_TIMEOUT_S}s)...",
+              file=sys.stderr)
+        ok, content = call_llm(build_recommendations_messages(compressed))
+        if not ok:
+            print(f"ContextPolice LLM error: {content}", file=sys.stderr)
+            sys.exit(1)
+        save_last_recommendations(content)
+        print()
+        print("=== Recommendations ===")
+        print()
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        return
+
+    print(f"[info] analyzing with {MODEL_ID} (up to {LLM_TIMEOUT_S}s)...",
+          file=sys.stderr)
+    ok, content = call_llm(build_analysis_messages(compressed))
+    if not ok:
+        print(f"ContextPolice LLM error: {content}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        parsed = parse_llm_json(content)
+        save_last_summary(parsed)
+        render_summary_plain(parsed)
+    except Exception as e:
+        print(f"[warn] could not parse JSON ({e}); raw response follows:",
+              file=sys.stderr)
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def run_standalone(force_mode: str | None = None) -> None:
     global TTY
 
-    TTY = open_tty()
-    sys.stdout = sys.stderr
+    if force_mode in ("raw", "llm", "menu", "recommend", "view-last", "edit-prompt"):
+        run_standalone_noninteractive(force_mode)
+        return
 
+    TTY = open_tty()
     if TTY is None:
-        sys.stderr.write("ContextPolice: no controlling terminal (/dev/tty).\n")
-        sys.exit(1)
+        # No terminal attached (e.g. invoked from Claude Code's Bash tool):
+        # degrade to non-interactive LLM analysis on stdout.
+        run_standalone_noninteractive("llm")
+        return
+
+    sys.stdout = sys.stderr
 
     transcript_path = find_latest_transcript()
     if not transcript_path:
@@ -563,9 +937,36 @@ def run_hook() -> None:
         return
 
 
+def _apply_bedrock_override() -> None:
+    """Switch PROVIDER to bedrock at runtime and re-pick provider-dependent
+    defaults, but only for fields the user didn't pin via env vars."""
+    global PROVIDER, MODEL_ID, MAX_LLM_CHARS
+    PROVIDER = "bedrock"
+    if "CONTEXT_POLICE_MODEL" not in os.environ:
+        MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    if "CONTEXT_POLICE_MAX_CHARS" not in os.environ:
+        MAX_LLM_CHARS = 400000
+
+
 def main() -> None:
-    if "--show" in sys.argv[1:]:
-        run_standalone()
+    args = sys.argv[1:]
+    if "--bedrock" in args:
+        _apply_bedrock_override()
+    if "--show" in args:
+        force_mode: str | None = None
+        if "--menu" in args:
+            force_mode = "menu"
+        elif "--raw" in args:
+            force_mode = "raw"
+        elif "--recommend" in args:
+            force_mode = "recommend"
+        elif "--last-summary" in args:
+            force_mode = "view-last"
+        elif "--edit-prompt" in args:
+            force_mode = "edit-prompt"
+        elif "--llm" in args:
+            force_mode = "llm"
+        run_standalone(force_mode)
         return
     run_hook()
 
