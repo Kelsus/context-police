@@ -108,6 +108,12 @@ Once installed, you don't need to do anything until the menu appears. When it fi
 1. Pick [4] or [5] if you want context before deciding
 2. Then pick [1] (block) and run `/compact focus on <what matters>`
 
+You can also open the UI on demand with:
+
+```bash
+/show-police
+```
+
 Examples:
 ```
 /compact focus on the authentication flow we are debugging
