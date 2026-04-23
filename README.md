@@ -1,16 +1,17 @@
 # context-police
 
-Intercepts automatic context compaction in Claude Code and gives you control over it before it happens.
+Intercepts automatic context compaction in Claude Code and gives you control before it happens.
 
 ## The problem
 
-Claude Code silently compacts the conversation when context approaches the 200k token limit. You have no say in when or how this happens.
+Claude Code can compact the conversation automatically when context approaches the limit. Without intervention, this can happen at a bad moment and with default summarization.
 
 ## What this does
 
-- **Blocks** automatic compaction from happening silently
-- **Notifies** you via desktop notification (macOS / Linux)
-- Lets you run `/compact focus on X` manually to control what gets preserved
+- Hooks into `PreCompact` with matcher `auto`
+- Shows an interactive terminal menu before compaction proceeds
+- Lets you choose to block, allow, or abort
+- Falls back to desktop notification + block in headless mode
 
 ## Install
 
@@ -18,32 +19,38 @@ Claude Code silently compacts the conversation when context approaches the 200k 
 curl -fsSL https://raw.githubusercontent.com/Kelsus/context-police/main/install.sh | bash
 ```
 
-**Requires:** `jq` — install with `brew install jq` (macOS) or `sudo apt install jq` (Linux)
+Requires: `jq` (used by the installer to merge `~/.claude/settings.json` safely).
+
+- macOS: `brew install jq`
+- Ubuntu/Debian: `sudo apt install jq`
+- Fedora: `sudo dnf install jq`
 
 ## How it works
 
 ```
 Context approaches limit
         ↓
-Claude Code fires PreCompact hook
+Claude Code fires PreCompact hook (auto)
         ↓
-Desktop notification fires → "Context limit approaching. Run /compact focus on X"
+context-police.sh opens a TUI menu:
+  [1] Block for now (default)
+  [2] Compact now
+  [3] Abort
         ↓
-Auto-compaction is blocked
-        ↓
-You run /compact focus on X manually
-        ↓
-Compaction happens with your chosen focus
+Decision is returned to Claude Code as hook JSON
 ```
 
-The hook only intercepts **automatic** compaction. Running `/compact` yourself is never blocked.
+Important: only automatic compaction is intercepted. Manual `/compact` runs are allowed.
 
 ## Usage
 
-Once installed, you don't need to do anything until you get the notification. When it fires:
+Once installed, wait for the menu to appear when context is near the limit.
 
-1. Switch to your Claude Code terminal
-2. Run `/compact focus on <what matters to you>`
+1. Choose `1` to block and then run `/compact focus on <what matters>` manually.
+2. Choose `2` to allow default compaction immediately.
+3. Choose `3` to abort the agent.
+
+In headless environments (no TTY), the hook sends a desktop notification (when available) and blocks by default.
 
 Examples:
 ```
@@ -54,7 +61,7 @@ Examples:
 
 ## Logs
 
-Blocked compaction attempts are logged to `~/.claude/context-police.log`.
+Actions are logged to `~/.claude/context-police.log`.
 
 ## Uninstall
 
