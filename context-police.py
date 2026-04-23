@@ -666,33 +666,40 @@ def load_last_summary() -> dict | None:
     return None
 
 
-def build_recommendations_messages(transcript_text: str, current_prompt: str) -> list[dict]:
+def build_recommendations_messages(
+    transcript_text: str, current_compact_instructions: str
+) -> list[dict]:
     system = (
-        "You are a Claude Code assistant reviewing a session transcript and improving "
-        "the system prompt used to extract categorized summaries from it.\n\n"
+        "You are a Claude Code assistant reviewing a session transcript. Your output is "
+        "used to update the `## Compact Instructions` section in the project's CLAUDE.md "
+        "— the text Claude Code re-reads during auto-compaction to guide how it "
+        "summarizes this conversation.\n\n"
         "Produce two things grounded in THIS specific transcript:\n"
-        "  (1) 3–7 concrete recommendations to reduce context-window usage\n"
-        "  (2) A full replacement for the extraction system prompt that integrates the "
-        "recommendations where they affect summarization behavior.\n\n"
+        "  (1) 3–7 concrete recommendations for the user on how to reduce context-window "
+        "usage (operational tips).\n"
+        "  (2) A full replacement for the `## Compact Instructions` block — plain Markdown "
+        "addressed to Claude Code itself, telling it what MUST be preserved and what can "
+        "be summarized away when this conversation is auto-compacted.\n\n"
         "Output ONLY a single valid JSON object, no markdown fences, matching:\n\n"
         "{\n"
         "  \"recommendations\": [\"imperative one-line bullet\", \"...\"],\n"
-        "  \"revised_prompt\": \"standalone replacement for the extraction system prompt\"\n"
+        "  \"compact_instructions\": \"plain markdown body for the ## Compact Instructions section\"\n"
         "}\n\n"
         "Rules:\n"
-        "- Each recommendation points at something specific in the transcript (a tool "
-        "call, file, topic, or pattern). No generic advice.\n"
-        "- `revised_prompt` must be self-contained. It MUST keep the JSON schema with "
-        "`categories`, each having `name`, `summary`, `percent_tokens`, and `items`. "
-        "Fold in applicable recommendations (e.g., category examples, truncation rules, "
-        "ordering guidance).\n"
+        "- Recommendations: each points at something specific in the transcript (a tool "
+        "call, file, topic, or pattern). No generic advice. One line each.\n"
+        "- `compact_instructions`: a self-contained markdown body (NO leading heading — "
+        "the heading is added by the caller). Keep it focused and short (≤ 40 lines). "
+        "Use imperative voice: \"Preserve ...\", \"Summarize ...\", \"Drop ...\". Mention "
+        "concrete artifacts from this conversation: specific file paths, decisions, open "
+        "questions that must survive compaction.\n"
         "- Do not wrap the JSON in code fences."
     )
     user = (
-        "Current extraction system prompt (between markers):\n\n"
-        "=== CURRENT PROMPT START ===\n"
-        f"{current_prompt}\n"
-        "=== CURRENT PROMPT END ===\n\n"
+        "Current `## Compact Instructions` body (between markers; may be empty):\n\n"
+        "=== CURRENT START ===\n"
+        f"{current_compact_instructions}\n"
+        "=== CURRENT END ===\n\n"
         "Session transcript follows (between markers):\n\n"
         "=== TRANSCRIPT START ===\n"
         f"{transcript_text}\n"
@@ -703,6 +710,76 @@ def build_recommendations_messages(transcript_text: str, current_prompt: str) ->
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+COMPACT_HEADING = "## Compact Instructions"
+
+
+def find_claude_md_target() -> Path:
+    """Locate the CLAUDE.md file to modify. Prefer nearest-ancestor project
+    CLAUDE.md; fall back to the global ~/.claude/CLAUDE.md; if neither
+    exists, point at <cwd>/CLAUDE.md so the user can create one."""
+    cur = Path.cwd()
+    for parent in [cur, *cur.parents]:
+        candidate = parent / "CLAUDE.md"
+        if candidate.exists():
+            return candidate
+    global_path = Path.home() / ".claude" / "CLAUDE.md"
+    if global_path.exists():
+        return global_path
+    return cur / "CLAUDE.md"
+
+
+def read_compact_instructions_from(md_path: Path) -> str:
+    """Extract the current body of `## Compact Instructions` (without the
+    heading line). Returns empty string if the file or section doesn't exist."""
+    try:
+        if not md_path.exists():
+            return ""
+        md = md_path.read_text()
+    except OSError:
+        return ""
+    lines = md.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == COMPACT_HEADING:
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if lines[j].lstrip().startswith("## "):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def replace_compact_instructions(md: str, new_body: str) -> str:
+    """Return md with `## Compact Instructions` replaced (or appended). new_body
+    is the section content without the heading."""
+    body = new_body.rstrip()
+    new_section = f"{COMPACT_HEADING}\n\n{body}\n"
+    lines = md.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == COMPACT_HEADING:
+            start = i
+            break
+    if start is None:
+        sep = "" if md.endswith("\n") else "\n"
+        trailing = "\n" if md.strip() else ""
+        return md + sep + trailing + new_section
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].lstrip().startswith("## "):
+            end = j
+            break
+    prefix = "".join(lines[:start])
+    suffix = "".join(lines[end:])
+    if suffix and not prefix.endswith("\n"):
+        prefix = prefix + "\n"
+    return prefix + new_section + ("\n" + suffix.lstrip("\n") if suffix.strip() else "")
 
 
 def save_last_recommendations(text: str) -> None:
@@ -719,7 +796,7 @@ def render_menu_static() -> None:
     transcript_path = find_latest_transcript() or "(none found)"
     custom = "(custom prompt)" if CUSTOM_PROMPT_PATH.exists() else "(default prompt)"
     cached = "yes" if LAST_SUMMARY_PATH.exists() else "no"
-    draft = "yes" if PROMPT_DRAFT_PATH.exists() else "no"
+    draft = "yes" if COMPACT_DRAFT_PATH.exists() else "no"
     lines = [
         "",
         "  ╔══════════════════════════════════════════╗",
@@ -789,31 +866,35 @@ def run_edit_prompt() -> None:
 
 
 def run_apply_draft() -> None:
-    if not PROMPT_DRAFT_PATH.exists():
+    if not COMPACT_DRAFT_PATH.exists():
         print(
             "No draft found. Run option [4] first to generate one.",
             file=sys.stderr,
         )
         sys.exit(1)
     try:
-        content = PROMPT_DRAFT_PATH.read_text()
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        CUSTOM_PROMPT_PATH.write_text(content)
-        PROMPT_DRAFT_PATH.unlink()
+        draft_body = COMPACT_DRAFT_PATH.read_text()
+        target_md = find_claude_md_target()
+        existing = target_md.read_text() if target_md.exists() else ""
+        updated = replace_compact_instructions(existing, draft_body)
+        target_md.parent.mkdir(parents=True, exist_ok=True)
+        target_md.write_text(updated)
+        COMPACT_DRAFT_PATH.unlink()
     except OSError as e:
         print(f"ContextPolice: could not apply draft: {e}", file=sys.stderr)
         sys.exit(1)
     print()
     print("=== Draft applied ===")
     print()
-    print(f"  Custom prompt: {CUSTOM_PROMPT_PATH}")
-    print("  Next analysis (options 1 or 2) will use the revised prompt.")
+    print(f"  Updated: {target_md}")
+    print("  Section: ## Compact Instructions")
+    print("  Claude Code will re-read this block during the next auto-compaction.")
     print("  Draft file removed.")
     print()
 
 
 def run_edit_draft() -> None:
-    if not PROMPT_DRAFT_PATH.exists():
+    if not COMPACT_DRAFT_PATH.exists():
         print(
             "No draft found. Run option [4] first to generate one.",
             file=sys.stderr,
@@ -822,25 +903,25 @@ def run_edit_draft() -> None:
     print()
     print("=== Draft edit ===")
     print()
-    print(f"  Draft path: {PROMPT_DRAFT_PATH}")
+    print(f"  Draft path: {COMPACT_DRAFT_PATH}")
     print()
     print("  Open in your editor, save, then reply 'a' to apply or 'd' to discard.")
     print()
     print("  Quick open:")
-    print(f"    code \"{PROMPT_DRAFT_PATH}\"")
-    print(f"    open -a TextEdit \"{PROMPT_DRAFT_PATH}\"")
-    print(f"    $EDITOR \"{PROMPT_DRAFT_PATH}\"")
+    print(f"    code \"{COMPACT_DRAFT_PATH}\"")
+    print(f"    open -a TextEdit \"{COMPACT_DRAFT_PATH}\"")
+    print(f"    $EDITOR \"{COMPACT_DRAFT_PATH}\"")
     print()
 
 
 def run_discard_draft() -> None:
-    if not PROMPT_DRAFT_PATH.exists():
+    if not COMPACT_DRAFT_PATH.exists():
         print()
         print("=== No draft to discard ===")
         print()
         return
     try:
-        PROMPT_DRAFT_PATH.unlink()
+        COMPACT_DRAFT_PATH.unlink()
     except OSError as e:
         print(f"ContextPolice: could not delete draft: {e}", file=sys.stderr)
         sys.exit(1)
@@ -897,14 +978,16 @@ def run_standalone_noninteractive(mode: str) -> None:
         print(f"[note] {note}", file=sys.stderr)
 
     if mode == "recommend":
-        current_prompt = load_custom_system_prompt() or _DEFAULT_ANALYSIS_SYSTEM_PROMPT
+        target_md = find_claude_md_target()
+        current_ci = read_compact_instructions_from(target_md)
         print(
-            f"[info] asking {MODEL_ID} for recommendations + prompt rewrite "
+            f"[info] asking {MODEL_ID} for recommendations + Compact Instructions rewrite "
             f"(up to {LLM_TIMEOUT_S}s)...",
             file=sys.stderr,
         )
+        print(f"[info] target CLAUDE.md: {target_md}", file=sys.stderr)
         ok, content = call_llm(
-            build_recommendations_messages(compressed, current_prompt)
+            build_recommendations_messages(compressed, current_ci)
         )
         if not ok:
             print(f"ContextPolice LLM error: {content}", file=sys.stderr)
@@ -917,7 +1000,7 @@ def run_standalone_noninteractive(mode: str) -> None:
             r = parsed.get("recommendations", [])
             if isinstance(r, list):
                 recs = [str(x).strip() for x in r if str(x).strip()]
-            revised = str(parsed.get("revised_prompt", "")).strip()
+            revised = str(parsed.get("compact_instructions", "")).strip()
         except Exception as e:
             print(
                 f"[warn] could not parse combined JSON ({e}); raw response follows:",
@@ -936,7 +1019,7 @@ def run_standalone_noninteractive(mode: str) -> None:
         if revised:
             try:
                 STATE_DIR.mkdir(parents=True, exist_ok=True)
-                PROMPT_DRAFT_PATH.write_text(revised + ("" if revised.endswith("\n") else "\n"))
+                COMPACT_DRAFT_PATH.write_text(revised + ("" if revised.endswith("\n") else "\n"))
                 draft_saved = True
             except OSError as e:
                 log(f"could not write prompt draft: {e}")
@@ -950,19 +1033,20 @@ def run_standalone_noninteractive(mode: str) -> None:
         else:
             print("(none returned)")
         print()
-        print("=== Proposed extraction prompt (preview) ===")
+        print("=== Proposed `## Compact Instructions` (preview) ===")
         print()
         if revised:
             for line in revised.splitlines():
                 print(f"  │ {line}")
             print()
             if draft_saved:
-                print(f"  Draft saved at: {PROMPT_DRAFT_PATH}")
+                print(f"  Draft saved at: {COMPACT_DRAFT_PATH}")
+            print(f"  Will be applied to: {target_md}")
         else:
             print("  (no rewrite returned)")
         print()
         print("  What now?")
-        print("    [a]  Apply this draft as your custom extraction prompt")
+        print(f"    [a]  Apply this draft to {target_md.name} as `## Compact Instructions`")
         print("    [e]  Edit the draft before applying")
         print("    [d]  Discard the draft")
         print("    any other reply: leave the draft in place and continue")
