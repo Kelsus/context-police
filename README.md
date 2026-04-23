@@ -65,9 +65,9 @@ Actions are logged to `~/.claude/context-police.log`.
 
 ## Uninstall
 
-Remove the hook script:
 ```bash
-rm ~/.claude/scripts/context-police.sh
+rm ~/.claude/scripts/context-police.py
+rm ~/.claude/commands/show-police.md
 ```
 
 Then remove the hook entry from `~/.claude/settings.json` under `hooks.PreCompact`.
