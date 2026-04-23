@@ -164,6 +164,36 @@ def render_menu() -> None:
     tui()
 
 
+def render_standalone_menu() -> None:
+    tui("  What do you want to do?")
+    tui()
+    tui(f"  [1]  {CYAN}View raw transcript{RESET}")
+    tui(f"  [2]  {CYAN}Analyze with LLM{RESET}      (categorized summary)")
+    tui(f"  [q]  Quit                  {DIM}[default]{RESET}")
+    tui()
+
+
+def find_latest_transcript() -> str | None:
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return None
+
+    cwd = os.getcwd()
+    encoded = cwd.replace("/", "-")
+    candidate_dir = projects_dir / encoded
+    if candidate_dir.exists():
+        jsonls = list(candidate_dir.glob("*.jsonl"))
+        if jsonls:
+            jsonls.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return str(jsonls[0])
+
+    all_jsonls = list(projects_dir.glob("*/*.jsonl"))
+    if not all_jsonls:
+        return None
+    all_jsonls.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(all_jsonls[0])
+
+
 def load_transcript(path: str) -> list[dict]:
     p = Path(path).expanduser()
     if not p.exists():
@@ -389,8 +419,43 @@ def show_summary(parsed: dict) -> None:
             tui(f"      • {item}")
         tui()
 
-    tui(f"  {DIM}Pick 1/2/3 now that you've seen the summary.{RESET}")
     tui()
+
+
+def action_view_raw(transcript_path: str | None) -> None:
+    if not transcript_path:
+        tui(f"  {RED}No transcript available.{RESET}")
+        return
+    records = load_transcript(transcript_path)
+    if not records:
+        tui(f"  {RED}Transcript empty or unreadable: {transcript_path}{RESET}")
+        return
+    show_raw_transcript(format_transcript(records))
+
+
+def action_analyze(transcript_path: str | None) -> None:
+    if not transcript_path:
+        tui(f"  {RED}No transcript available.{RESET}")
+        return
+    records = load_transcript(transcript_path)
+    if not records:
+        tui(f"  {RED}Transcript empty or unreadable: {transcript_path}{RESET}")
+        return
+    text = format_transcript(records)
+    compressed, truncated, note = compress_for_llm(text)
+    if truncated:
+        tui(f"  {YELLOW}Note: {note}{RESET}")
+    tui(f"  {DIM}Analyzing with {MODEL_ID}... (up to {LLM_TIMEOUT_S}s){RESET}")
+    ok, content = call_llm(build_analysis_messages(compressed))
+    if not ok:
+        tui(f"  {RED}LLM error: {content}{RESET}")
+        return
+    try:
+        parsed = parse_llm_json(content)
+        show_summary(parsed)
+    except Exception as e:
+        tui(f"  {YELLOW}Could not parse JSON ({e}). Raw response:{RESET}")
+        tui(content)
 
 
 def headless_notify(msg: str) -> None:
@@ -410,7 +475,46 @@ def headless_notify(msg: str) -> None:
         pass
 
 
-def main() -> None:
+def run_standalone() -> None:
+    global TTY
+
+    TTY = open_tty()
+    sys.stdout = sys.stderr
+
+    if TTY is None:
+        sys.stderr.write("ContextPolice: no controlling terminal (/dev/tty).\n")
+        sys.exit(1)
+
+    transcript_path = find_latest_transcript()
+    if not transcript_path:
+        tui(f"  {RED}Could not auto-detect a transcript under ~/.claude/projects/.{RESET}")
+        sys.exit(1)
+
+    log(f"standalone mode opened, transcript={transcript_path}")
+
+    while True:
+        tui()
+        tui(f"  {CYAN}╔══════════════════════════════════════════╗{RESET}")
+        tui(f"  {CYAN}║{RESET}      {BOLD}ContextPolice — Inspector{RESET}           {CYAN}║{RESET}")
+        tui(f"  {CYAN}╚══════════════════════════════════════════╝{RESET}")
+        tui()
+        tui(f"  Transcript: {DIM}{transcript_path}{RESET}")
+        tui()
+        render_standalone_menu()
+        choice = tui_input()
+
+        if choice == "1":
+            action_view_raw(transcript_path)
+            continue
+        if choice == "2":
+            action_analyze(transcript_path)
+            continue
+        if choice in ("q", "Q", "0", ""):
+            sys.exit(0)
+        tui(f"  {YELLOW}Unknown choice: {choice!r}{RESET}")
+
+
+def run_hook() -> None:
     global TTY
 
     payload = read_payload()
@@ -421,7 +525,6 @@ def main() -> None:
         return
 
     TTY = open_tty()
-
     sys.stdout = sys.stderr
 
     if TTY is None:
@@ -449,44 +552,22 @@ def main() -> None:
             emit_decision("block", "Aborted by user via ContextPolice.")
             return
         if choice == "4":
-            if not transcript_path:
-                tui(f"  {RED}No transcript_path in hook payload — can't show raw.{RESET}")
-                continue
-            records = load_transcript(transcript_path)
-            if not records:
-                tui(f"  {RED}Transcript empty or unreadable: {transcript_path}{RESET}")
-                continue
-            text = format_transcript(records)
-            show_raw_transcript(text)
+            action_view_raw(transcript_path)
             continue
         if choice == "5":
-            if not transcript_path:
-                tui(f"  {RED}No transcript_path in hook payload — can't analyze.{RESET}")
-                continue
-            records = load_transcript(transcript_path)
-            if not records:
-                tui(f"  {RED}Transcript empty or unreadable: {transcript_path}{RESET}")
-                continue
-            text = format_transcript(records)
-            compressed, truncated, note = compress_for_llm(text)
-            if truncated:
-                tui(f"  {YELLOW}Note: {note}{RESET}")
-            tui(f"  {DIM}Analyzing with {MODEL_ID}... (up to {LLM_TIMEOUT_S}s){RESET}")
-            ok, content = call_llm(build_analysis_messages(compressed))
-            if not ok:
-                tui(f"  {RED}LLM error: {content}{RESET}")
-                continue
-            try:
-                parsed = parse_llm_json(content)
-                show_summary(parsed)
-            except Exception as e:
-                tui(f"  {YELLOW}Could not parse JSON ({e}). Raw response:{RESET}")
-                tui(content)
+            action_analyze(transcript_path)
             continue
 
         log("auto-compaction blocked by user")
         emit_decision("block", block_reason)
         return
+
+
+def main() -> None:
+    if "--show" in sys.argv[1:]:
+        run_standalone()
+        return
+    run_hook()
 
 
 if __name__ == "__main__":

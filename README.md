@@ -85,6 +85,22 @@ Override behavior via env vars (set in the shell that launches Claude Code):
 | `CONTEXT_POLICE_TOOL_TRUNC` | `500` | Chars kept from each `tool_result` body |
 | `CONTEXT_POLICE_LOG` | `~/.claude/context-police.log` | Log file path |
 
+## `/show-police` — open the inspector on demand
+
+You don't have to wait for an auto-compact to inspect the current session. The installer also registers a Claude Code slash command:
+
+```
+/show-police
+```
+
+This invokes `context-police.py --show`, which auto-discovers the most recent transcript for the current working directory (falling back to the globally-latest transcript) and opens a reduced menu:
+
+- **[1] View raw transcript** — pipes it through `less`
+- **[2] Analyze with LLM** — same categorized-summary output as option 5 in the auto-compact menu
+- **[q] Quit**
+
+Useful for sanity-checking before running `/compact focus on X` manually, or just to understand what the LLM "sees" in your session.
+
 ## Usage
 
 Once installed, you don't need to do anything until the menu appears. When it fires:
@@ -120,6 +136,7 @@ If that fails, the server isn't running or isn't in OpenAI-compat mode. Override
 
 ```bash
 rm ~/.claude/scripts/context-police.py
+rm ~/.claude/commands/show-police.md
 ```
 
 Then remove the hook entry from `~/.claude/settings.json` under `hooks.PreCompact`.

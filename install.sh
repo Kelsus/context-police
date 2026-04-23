@@ -3,9 +3,11 @@ set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/Kelsus/context-police/main"
 SCRIPTS_DIR="$HOME/.claude/scripts"
+COMMANDS_DIR="$HOME/.claude/commands"
 SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOK_PATH="$SCRIPTS_DIR/context-police.py"
 LEGACY_PATH="$SCRIPTS_DIR/context-police.sh"
+COMMAND_PATH="$COMMANDS_DIR/show-police.md"
 
 echo "Installing context-police..."
 
@@ -19,10 +21,14 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 mkdir -p "$SCRIPTS_DIR"
+mkdir -p "$COMMANDS_DIR"
 
 echo "Downloading hook script..."
 curl -fsSL "$REPO/context-police.py" -o "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
+
+echo "Downloading /show-police slash command..."
+curl -fsSL "$REPO/commands/show-police.md" -o "$COMMAND_PATH"
 
 if [ -f "$LEGACY_PATH" ]; then
   rm "$LEGACY_PATH"
@@ -80,6 +86,7 @@ echo "What happens next:"
 echo "  - Auto-compaction triggers an interactive TUI"
 echo "  - Options: block, compact now, abort, view raw transcript, analyze with local LLM"
 echo "  - LLM analysis uses http://172.21.0.154:1234 with model qwen/qwen3-8b by default"
+echo "  - Run /show-police at any time to open the inspector for the current session"
 echo ""
 echo "Configure via env vars (optional):"
 echo "  CONTEXT_POLICE_LLM_URL, CONTEXT_POLICE_MODEL, CONTEXT_POLICE_TIMEOUT,"
