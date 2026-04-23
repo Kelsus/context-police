@@ -35,6 +35,7 @@ STATE_DIR = Path.home() / ".claude" / "context-police"
 LAST_SUMMARY_PATH = STATE_DIR / "last-summary.json"
 LAST_RECO_PATH = STATE_DIR / "last-recommendations.md"
 CUSTOM_PROMPT_PATH = STATE_DIR / "extract-prompt.md"
+COMPACT_DRAFT_PATH = STATE_DIR / "compact-instructions.draft.md"
 
 _REAL_STDOUT = sys.__stdout__
 TTY = None
@@ -665,23 +666,38 @@ def load_last_summary() -> dict | None:
     return None
 
 
-def build_recommendations_messages(transcript_text: str) -> list[dict]:
+def build_recommendations_messages(transcript_text: str, current_prompt: str) -> list[dict]:
     system = (
-        "You are a Claude Code assistant reviewing a session transcript. The user wants "
-        "concrete, actionable recommendations to reduce context-window usage and avoid "
-        "hitting auto-compaction. Tie every recommendation to something specific in THIS "
-        "transcript — a particular tool call, file, topic, or pattern that is bloating "
-        "context. Do not produce generic advice.\n\n"
-        "Output ONLY a Markdown bullet list. 3–7 bullets. Each bullet is one line, "
-        "imperative voice. No headings, no preamble, no closing remarks."
+        "You are a Claude Code assistant reviewing a session transcript and improving "
+        "the system prompt used to extract categorized summaries from it.\n\n"
+        "Produce two things grounded in THIS specific transcript:\n"
+        "  (1) 3–7 concrete recommendations to reduce context-window usage\n"
+        "  (2) A full replacement for the extraction system prompt that integrates the "
+        "recommendations where they affect summarization behavior.\n\n"
+        "Output ONLY a single valid JSON object, no markdown fences, matching:\n\n"
+        "{\n"
+        "  \"recommendations\": [\"imperative one-line bullet\", \"...\"],\n"
+        "  \"revised_prompt\": \"standalone replacement for the extraction system prompt\"\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Each recommendation points at something specific in the transcript (a tool "
+        "call, file, topic, or pattern). No generic advice.\n"
+        "- `revised_prompt` must be self-contained. It MUST keep the JSON schema with "
+        "`categories`, each having `name`, `summary`, `percent_tokens`, and `items`. "
+        "Fold in applicable recommendations (e.g., category examples, truncation rules, "
+        "ordering guidance).\n"
+        "- Do not wrap the JSON in code fences."
     )
     user = (
-        "Transcript follows between the markers. Produce the bullet list of "
-        "recommendations and nothing else.\n\n"
+        "Current extraction system prompt (between markers):\n\n"
+        "=== CURRENT PROMPT START ===\n"
+        f"{current_prompt}\n"
+        "=== CURRENT PROMPT END ===\n\n"
+        "Session transcript follows (between markers):\n\n"
         "=== TRANSCRIPT START ===\n"
         f"{transcript_text}\n"
         "=== TRANSCRIPT END ===\n\n"
-        "Now emit the recommendations:"
+        "Now emit the JSON object:"
     )
     return [
         {"role": "system", "content": system},
@@ -703,6 +719,7 @@ def render_menu_static() -> None:
     transcript_path = find_latest_transcript() or "(none found)"
     custom = "(custom prompt)" if CUSTOM_PROMPT_PATH.exists() else "(default prompt)"
     cached = "yes" if LAST_SUMMARY_PATH.exists() else "no"
+    draft = "yes" if PROMPT_DRAFT_PATH.exists() else "no"
     lines = [
         "",
         "  ╔══════════════════════════════════════════╗",
@@ -710,17 +727,19 @@ def render_menu_static() -> None:
         "  ╚══════════════════════════════════════════╝",
         "",
         f"  Transcript: {transcript_path}",
-        f"  Prompt: {custom}    Cached summary: {cached}",
+        f"  Prompt: {custom}    Cached summary: {cached}    Draft: {draft}",
         "",
         "  What do you want to do?",
         "",
         "  [1]  LLM analysis (Bedrock Sonnet 4.5)    categories + token bars",
         "  [2]  LLM analysis (local LM Studio)       categories + token bars",
         "  [3]  Raw transcript                       dump formatted, as-is",
-        "  [4]  Recommendations                      actionable tips to reduce context",
+        "  [4]  Recommendations + prompt rewrite     preview a revised prompt",
         "  [5]  Edit summarization prompt            seed/override the system prompt",
         "  [6]  View last cached summary             no new LLM call",
         "  [q]  Quit",
+        "",
+        "  After [4] you can reply 'a' apply / 'e' edit / 'd' discard the draft.",
         "",
     ]
     sys.stdout.write("\n".join(lines) + "\n")
@@ -769,6 +788,67 @@ def run_edit_prompt() -> None:
     print()
 
 
+def run_apply_draft() -> None:
+    if not PROMPT_DRAFT_PATH.exists():
+        print(
+            "No draft found. Run option [4] first to generate one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        content = PROMPT_DRAFT_PATH.read_text()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CUSTOM_PROMPT_PATH.write_text(content)
+        PROMPT_DRAFT_PATH.unlink()
+    except OSError as e:
+        print(f"ContextPolice: could not apply draft: {e}", file=sys.stderr)
+        sys.exit(1)
+    print()
+    print("=== Draft applied ===")
+    print()
+    print(f"  Custom prompt: {CUSTOM_PROMPT_PATH}")
+    print("  Next analysis (options 1 or 2) will use the revised prompt.")
+    print("  Draft file removed.")
+    print()
+
+
+def run_edit_draft() -> None:
+    if not PROMPT_DRAFT_PATH.exists():
+        print(
+            "No draft found. Run option [4] first to generate one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print()
+    print("=== Draft edit ===")
+    print()
+    print(f"  Draft path: {PROMPT_DRAFT_PATH}")
+    print()
+    print("  Open in your editor, save, then reply 'a' to apply or 'd' to discard.")
+    print()
+    print("  Quick open:")
+    print(f"    code \"{PROMPT_DRAFT_PATH}\"")
+    print(f"    open -a TextEdit \"{PROMPT_DRAFT_PATH}\"")
+    print(f"    $EDITOR \"{PROMPT_DRAFT_PATH}\"")
+    print()
+
+
+def run_discard_draft() -> None:
+    if not PROMPT_DRAFT_PATH.exists():
+        print()
+        print("=== No draft to discard ===")
+        print()
+        return
+    try:
+        PROMPT_DRAFT_PATH.unlink()
+    except OSError as e:
+        print(f"ContextPolice: could not delete draft: {e}", file=sys.stderr)
+        sys.exit(1)
+    print()
+    print("=== Draft discarded ===")
+    print()
+
+
 def run_standalone_noninteractive(mode: str) -> None:
     """No-TTY fallback: produce plain-text output on stdout so a caller
     (Claude Code's Bash tool, a pipe, CI, etc.) can display it."""
@@ -780,6 +860,15 @@ def run_standalone_noninteractive(mode: str) -> None:
         return
     if mode == "edit-prompt":
         run_edit_prompt()
+        return
+    if mode == "apply-draft":
+        run_apply_draft()
+        return
+    if mode == "edit-draft":
+        run_edit_draft()
+        return
+    if mode == "discard-draft":
+        run_discard_draft()
         return
 
     transcript_path = find_latest_transcript()
@@ -808,20 +897,76 @@ def run_standalone_noninteractive(mode: str) -> None:
         print(f"[note] {note}", file=sys.stderr)
 
     if mode == "recommend":
-        print(f"[info] asking {MODEL_ID} for recommendations (up to {LLM_TIMEOUT_S}s)...",
-              file=sys.stderr)
-        ok, content = call_llm(build_recommendations_messages(compressed))
+        current_prompt = load_custom_system_prompt() or _DEFAULT_ANALYSIS_SYSTEM_PROMPT
+        print(
+            f"[info] asking {MODEL_ID} for recommendations + prompt rewrite "
+            f"(up to {LLM_TIMEOUT_S}s)...",
+            file=sys.stderr,
+        )
+        ok, content = call_llm(
+            build_recommendations_messages(compressed, current_prompt)
+        )
         if not ok:
             print(f"ContextPolice LLM error: {content}", file=sys.stderr)
             sys.exit(1)
-        save_last_recommendations(content)
+
+        recs: list[str] = []
+        revised: str = ""
+        try:
+            parsed = parse_llm_json(content)
+            r = parsed.get("recommendations", [])
+            if isinstance(r, list):
+                recs = [str(x).strip() for x in r if str(x).strip()]
+            revised = str(parsed.get("revised_prompt", "")).strip()
+        except Exception as e:
+            print(
+                f"[warn] could not parse combined JSON ({e}); raw response follows:",
+                file=sys.stderr,
+            )
+            sys.stdout.write(content)
+            if not content.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+            return
+
+        recs_md = "\n".join(f"- {b}" for b in recs) + ("\n" if recs else "")
+        save_last_recommendations(recs_md)
+
+        draft_saved = False
+        if revised:
+            try:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                PROMPT_DRAFT_PATH.write_text(revised + ("" if revised.endswith("\n") else "\n"))
+                draft_saved = True
+            except OSError as e:
+                log(f"could not write prompt draft: {e}")
+
         print()
         print("=== Recommendations ===")
         print()
-        sys.stdout.write(content)
-        if not content.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+        if recs:
+            for b in recs:
+                print(f"- {b}")
+        else:
+            print("(none returned)")
+        print()
+        print("=== Proposed extraction prompt (preview) ===")
+        print()
+        if revised:
+            for line in revised.splitlines():
+                print(f"  │ {line}")
+            print()
+            if draft_saved:
+                print(f"  Draft saved at: {PROMPT_DRAFT_PATH}")
+        else:
+            print("  (no rewrite returned)")
+        print()
+        print("  What now?")
+        print("    [a]  Apply this draft as your custom extraction prompt")
+        print("    [e]  Edit the draft before applying")
+        print("    [d]  Discard the draft")
+        print("    any other reply: leave the draft in place and continue")
+        print()
         return
 
     print(f"[info] analyzing with {MODEL_ID} (up to {LLM_TIMEOUT_S}s)...",
@@ -846,7 +991,10 @@ def run_standalone_noninteractive(mode: str) -> None:
 def run_standalone(force_mode: str | None = None) -> None:
     global TTY
 
-    if force_mode in ("raw", "llm", "menu", "recommend", "view-last", "edit-prompt"):
+    if force_mode in (
+        "raw", "llm", "menu", "recommend", "view-last",
+        "edit-prompt", "apply-draft", "edit-draft", "discard-draft",
+    ):
         run_standalone_noninteractive(force_mode)
         return
 
@@ -964,6 +1112,12 @@ def main() -> None:
             force_mode = "view-last"
         elif "--edit-prompt" in args:
             force_mode = "edit-prompt"
+        elif "--apply-draft" in args:
+            force_mode = "apply-draft"
+        elif "--edit-draft" in args:
+            force_mode = "edit-draft"
+        elif "--discard-draft" in args:
+            force_mode = "discard-draft"
         elif "--llm" in args:
             force_mode = "llm"
         run_standalone(force_mode)
